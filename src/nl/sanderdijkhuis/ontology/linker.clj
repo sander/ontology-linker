@@ -76,8 +76,13 @@
                        :annotations/grouped-by-language-and-package (str (namespace %) \- (name %))
                        %) path)))
 
+(defn link-sexp [s]
+  (cond
+    (string? s) {::local-absolute-id [:concepts/by-id s]}
+    :else (let [[h & t] s] (cons h (map link-sexp t)))))
+
 (defn enrich-definition [{c :definition :as v}]
-  (if c (assoc v :definition {::local-absolute-id [:concepts/by-id c]}) v))
+  (if c (assoc v :definition (link-sexp c)) v))
 
 (defn enrich-slots [{s :slots :as v}]
   (if s (assoc v :slots (map enrich-definition s)) v))
