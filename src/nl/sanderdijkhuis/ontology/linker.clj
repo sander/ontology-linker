@@ -35,10 +35,10 @@
        (map (fn [[language packages]] {::language language ::packages packages}))))
 
 (def index {:annotations {::local-absolute-id [:annotations/grouped-by-language-and-package]}
-            :concepts {::local-absolute-id [:concepts/alphabetical-by-name]}})
+            :concepts    {::local-absolute-id [:concepts/alphabetical-by-name]}})
 
 (defn list->db [defs]
-  {:index index
+  {:index             index
    :concepts/by-id    (into {} (comp (filter concept?) (map (juxt :id identity))) defs)
    :annotations/by-id (into {} (comp (filter annotation?) (map (juxt (juxt :language :package :id) identity))) defs)})
 
@@ -90,7 +90,21 @@
 (defn enrich-isa [{a :is-a :as v}]
   (if a (assoc v :is-a (map (fn [s] {::local-absolute-id [:concepts/by-id s]}) (flatten [a]))) v))
 
-(def enrich (comp enrich-definition enrich-slots enrich-isa))
+(defn enrich-ontology [v]
+  (if (map? v) (assoc v ::ontology {::local-absolute-id [:index]}) v))
+
+(defn add-links-to-concept-inputs-or-outputs [is]
+  (map (fn [{type :type :as i}]
+         (if type (assoc i :type {::local-absolute-id [:concepts/by-id type]}) i))
+       is))
+
+(defn enrich-inputs [{is :inputs :as v}]
+  (if is (assoc v :inputs (add-links-to-concept-inputs-or-outputs is)) v))
+
+(defn enrich-outputs [{is :outputs :as v}]
+  (if is (assoc v :outputs (add-links-to-concept-inputs-or-outputs is)) v))
+
+(def enrich (comp enrich-definition enrich-slots enrich-isa enrich-ontology enrich-inputs enrich-outputs))
 
 (defn build-linked-data!
   "Reads recursively a folder of JSON concept definitions and code annotations, writes JSON-LD to output."
@@ -100,6 +114,7 @@
        list->db
        db->indexed-db
        db->files
+       (filter #(:inputs (second %)))
        (into {} (map (fn [[base doc]]
                        [base (walk/postwalk (local-absolute-id->relative-id base) doc)])))
        (walk/postwalk #(if-let [id (::local-relative-id %)]
