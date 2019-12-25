@@ -31,7 +31,7 @@
        (group-by #(let [{[_ language package] ::local-absolute-id} %] [language package]))
        (sort-by first)
        (map (fn [[package annotations]] {::package package ::annotations annotations}))
-       (group-by (comp first first))
+       (group-by (comp first ::package))
        (map (fn [[language packages]] {::language language ::packages packages}))))
 
 (def index {:annotations {::local-absolute-id [:annotations/grouped-by-language-and-package]}
