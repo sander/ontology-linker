@@ -114,7 +114,6 @@
        list->db
        db->indexed-db
        db->files
-       (filter #(:inputs (second %)))
        (into {} (map (fn [[base doc]]
                        [base (walk/postwalk (local-absolute-id->relative-id base) doc)])))
        (walk/postwalk #(if-let [id (::local-relative-id %)]
