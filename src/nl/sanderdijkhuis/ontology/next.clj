@@ -33,6 +33,24 @@
                 {:reference/concept concept :reference/source source})))
        (into [] (add-indices))))
 
+(defn inputs-references [db]
+  (->> db
+       (d/q '[:find ?concept (pull ?port [:description :name]) ?port-concept
+              :where [?concept :inputs ?port] [?port :type ?type] [?port-concept :id ?type]])
+       (map (fn [[concept {:keys [description name]} type]]
+              {:port/input-for concept :port/name name :port/description description :port/type type}))
+       (map (fn [m] (into {} (filter val) m)))
+       (into [] (add-indices))))
+
+(defn outputs-references [db]
+  (->> db
+       (d/q '[:find ?concept (pull ?port [:description :name]) ?port-concept
+              :where [?concept :outputs ?port] [?port :type ?type] [?port-concept :id ?type]])
+       (map (fn [[concept {:keys [description name]} type]]
+              {:port/output-for concept :port/name name :port/description description :port/type type}))
+       (map (fn [m] (into {} (filter val) m)))
+       (into [] (add-indices))))
+
 (defn expand-definitions [x]
   (let [index (into {} (comp (filter (comp #{"concept"} :schema)) (map (juxt :id :db/id))) x)]
     (letfn [(expand [d] (if (vector? d)
@@ -47,14 +65,6 @@
                (-> v (assoc :annotation/definition (expand d)) (dissoc :definition))
                v))
        x))))
-
-#_
-(defn xp-desc []
-  (fn [xf]
-    (fn
-      ([] (xf))
-      ([result] (xf (expand-definitions result)))
-      ([result input] (xf result input)))))
 
 (defn add-path [{s :schema i :id lang :language pkg :package :as x}]
   (assoc x :path/absolute (case s
@@ -77,7 +87,12 @@
                 :annotation/definition {:db/isComponent true :db/valueType :db.type/ref}
                 :sexp/arguments        {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
                 :sexp/atom             {:db/valueType :db.type/ref}
-                :reference/concept     {:db/valueType :db.type/ref}}
+                :reference/concept     {:db/valueType :db.type/ref}
+                :inputs {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                :outputs {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                :port/input-for {:db/valueType :db.type/ref}
+                :port/output-for {:db/valueType :db.type/ref}
+                :port/type {:db/valueType :db.type/ref}}
         conn (d/create-conn schema)]
     (->> (read-definitions! (io/as-file input))
          (mapcat #(cond (map? %) [%] (vector? %) %))
@@ -88,16 +103,21 @@
          (d/transact! conn))
     (d/transact! conn (is-a-references @conn))
     (d/transact! conn (references-references @conn))
+    (d/transact! conn (inputs-references @conn))
+    (d/transact! conn (outputs-references @conn))
     (d/q '[:find [(pull ?e [:id :name :description :kind :definition
                             {(:reference/_concept :as :concept/references)
                              [{:reference/source [:DOI :author :issued :publisher :title :type :edition :title-short :volume :container-title :issue]}
                               :reference/note]}
+                            {(:port/_input-for :as :concept/inputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
+                            {(:port/_output-for :as :concept/outputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
                             :db/id
+                            :is-a
                             {:concept/is-a [:name :db/id]}
-                            :external :kind :inputs :outputs
+                            :external :kind
                             :edit/link])
                   ...]
-           :where [?e :schema "concept"] [?e :inputs]]
+           :where [?e :schema "concept"]]
          @conn)))
 
 ;; create index :db/id -> absolute-path, then walk through each doc and replace :db/id with relative-path
