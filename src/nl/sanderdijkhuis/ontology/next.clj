@@ -51,6 +51,19 @@
        (map (fn [m] (into {} (filter val) m)))
        (into [] (add-indices))))
 
+(defn external-references [db]
+  (->> db
+       (d/q '[:find ?concept ?references
+              :where [?concept :external ?references]])
+       (mapcat (fn [[concept refs]]
+                 (map (fn [[key id]]
+                        {:external/to concept :external/site (name key) :external/key id
+                         :external/url (case key
+                                         :wikipedia (str "https://en.wikipedia.org/wiki/" id)
+                                         :wikidata (str "https://www.wikidata.org/wiki/" id))})
+                      refs)))
+       (into [] (add-indices))))
+
 (defn expand-definitions [x]
   (let [index (into {} (comp (filter (comp #{"concept"} :schema)) (map (juxt :id :db/id))) x)]
     (letfn [(expand [d] (if (vector? d)
@@ -92,12 +105,13 @@
                 :outputs {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
                 :port/input-for {:db/valueType :db.type/ref}
                 :port/output-for {:db/valueType :db.type/ref}
-                :port/type {:db/valueType :db.type/ref}}
+                :port/type {:db/valueType :db.type/ref}
+                :external/to {:db/valueType :db.type/ref}}
         conn (d/create-conn schema)]
     (->> (read-definitions! (io/as-file input))
          (mapcat #(cond (map? %) [%] (vector? %) %))
          (into [] (add-indices))
-         expand-definitions
+         (expand-definitions)
          (map add-path)
          (map add-edit-link)
          (d/transact! conn))
@@ -105,17 +119,13 @@
     (d/transact! conn (references-references @conn))
     (d/transact! conn (inputs-references @conn))
     (d/transact! conn (outputs-references @conn))
-    (d/q '[:find [(pull ?e [:id :name :description :kind :definition
-                            {(:reference/_concept :as :concept/references)
-                             [{:reference/source [:DOI :author :issued :publisher :title :type :edition :title-short :volume :container-title :issue]}
-                              :reference/note]}
+    (d/transact! conn (external-references @conn))
+    (d/q '[:find [(pull ?e [:name :description :kind :definition :edit/link :path/absolute
+                            {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type :edition :title-short :volume :container-title :issue] } :reference/note]}
                             {(:port/_input-for :as :concept/inputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
                             {(:port/_output-for :as :concept/outputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
-                            :db/id
-                            :is-a
-                            {:concept/is-a [:name :db/id]}
-                            :external :kind
-                            :edit/link])
+                            {(:external/_to :as :concepts/external-links) [:external/key :external/site :external/url]}
+                            {:concept/is-a [:name :path/absolute]}])
                   ...]
            :where [?e :schema "concept"]]
          @conn)))
