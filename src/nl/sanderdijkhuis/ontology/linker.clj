@@ -143,7 +143,9 @@
   (assoc db ::reverse-links (->> (reverse-links db)
                                  (filter #(not (#{[:index] [:annotations/grouped-by-language-and-package] [:concepts/alphabetical-by-name]} (key %))))
                                  (map (fn [[id links]]
-                                        [id (filter #(not (#{[:concepts/alphabetical-by-name]} (first %))) links)]))
+                                        [id (into [] (comp (filter #(not (#{[:concepts/alphabetical-by-name]} (first %))))
+                                                           #_(map (fn [[src prop]] {::property prop} src)))
+                                                  links)]))
                                  (filter #(not (empty? (second %))))
                                  (into {})))
   ;; groeperen: id -> relatie (pak alleen eerste) -> brondoc (met context?)
