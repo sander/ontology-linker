@@ -1,12 +1,9 @@
 (ns nl.sanderdijkhuis.ontology.next
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
-            [clojure.string :as str]
-            [clojure.walk :as walk]
             [clojure.pprint :refer [pprint]]
             [datascript.core :as d])
-  (:import (java.io File)
-           (java.net URI)))
+  (:import (java.io File)))
 
 (defn read-definitions! [^File path]
   (into [] (comp (filter #(.isFile %))
@@ -14,26 +11,21 @@
                  (map io/reader)
                  (map #(json/read % :key-fn keyword))) (file-seq path)))
 
-(defn is-a-references [db]
-  (->> db
-       (d/q '[:find ?e ?a
-              :where [?e :schema "concept"] [?e :is-a ?a-id] [?a :id ?a-id]])
-       (map (fn [[e a]] [:db/add e :concept/is-a a]))))
-
 (defn add-indices []
   (map-indexed #(assoc %2 :db/id (- (inc %1)))))
 
-(defn references-references [db]
-  (->> db
-       (d/q '[:find ?concept ?source (pull ?reference [:note])
-              :where [?concept :references ?reference] [?reference :key ?key] [?source :id ?key]])
-       (map (fn [[concept source {:keys [note]}]]
-              (if note
-                {:reference/concept concept :reference/source source :reference/note note}
-                {:reference/concept concept :reference/source source})))
-       (into [] (add-indices))))
+(defn is-a-references-tx [db]
+  (map (fn [[e a]] [:db/add e :concept/is-a a])
+       (d/q '[:find ?e ?a :where [?e :schema "concept"] [?e :is-a ?a-id] [?a :id ?a-id]] db)))
 
-(defn inputs-references [db]
+(defn references-references-tx [db]
+  (into [] (comp (map (fn [[concept source {:keys [note]}]]
+                        (into {} (filter val) {:reference/concept concept :reference/source source :reference/note note})))
+                 (add-indices))
+        (d/q '[:find ?concept ?source (pull ?reference [:note])
+               :where [?concept :references ?reference] [?reference :key ?key] [?source :id ?key]] db)))
+
+(defn inputs-references-tx [db]
   (->> db
        (d/q '[:find ?concept (pull ?port [:description :name]) ?port-concept
               :where [?concept :inputs ?port] [?port :type ?type] [?port-concept :id ?type]])
@@ -42,7 +34,7 @@
        (map (fn [m] (into {} (filter val) m)))
        (into [] (add-indices))))
 
-(defn outputs-references [db]
+(defn outputs-references-tx [db]
   (->> db
        (d/q '[:find ?concept (pull ?port [:description :name]) ?port-concept
               :where [?concept :outputs ?port] [?port :type ?type] [?port-concept :id ?type]])
@@ -51,7 +43,7 @@
        (map (fn [m] (into {} (filter val) m)))
        (into [] (add-indices))))
 
-(defn external-references [db]
+(defn external-references-tx [db]
   (->> db
        (d/q '[:find ?concept ?references
               :where [?concept :external ?references]])
@@ -92,21 +84,23 @@
       "annotation" (assoc x :edit/link (str prefix "annotation/" lang "/" pkg "/" id ".yml"))
       x)))
 
+(def schema
+  {:is-a                  {:db/cardinality :db.cardinality/many}
+   :concept/is-a          {:db/cardinality :db.cardinality/many}
+   :references            {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :annotation/definition {:db/isComponent true :db/valueType :db.type/ref}
+   :sexp/arguments        {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :sexp/atom             {:db/valueType :db.type/ref}
+   :reference/concept     {:db/valueType :db.type/ref}
+   :inputs                {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :outputs               {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :port/input-for        {:db/valueType :db.type/ref}
+   :port/output-for       {:db/valueType :db.type/ref}
+   :port/type             {:db/valueType :db.type/ref}
+   :external/to           {:db/valueType :db.type/ref}})
+
 (comment
   (let [input "/home/sander/src/datascienceontology/build"
-        schema {:is-a                  {:db/cardinality :db.cardinality/many}
-                :concept/is-a          {:db/cardinality :db.cardinality/many}
-                :references            {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
-                :annotation/definition {:db/isComponent true :db/valueType :db.type/ref}
-                :sexp/arguments        {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
-                :sexp/atom             {:db/valueType :db.type/ref}
-                :reference/concept     {:db/valueType :db.type/ref}
-                :inputs {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
-                :outputs {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
-                :port/input-for {:db/valueType :db.type/ref}
-                :port/output-for {:db/valueType :db.type/ref}
-                :port/type {:db/valueType :db.type/ref}
-                :external/to {:db/valueType :db.type/ref}}
         conn (d/create-conn schema)]
     (->> (read-definitions! (io/as-file input))
          (mapcat #(cond (map? %) [%] (vector? %) %))
@@ -115,11 +109,8 @@
          (map add-path)
          (map add-edit-link)
          (d/transact! conn))
-    (d/transact! conn (is-a-references @conn))
-    (d/transact! conn (references-references @conn))
-    (d/transact! conn (inputs-references @conn))
-    (d/transact! conn (outputs-references @conn))
-    (d/transact! conn (external-references @conn))
+    (doseq [tx [is-a-references-tx references-references-tx inputs-references-tx outputs-references-tx external-references-tx]]
+      (d/transact! conn (tx @conn)))
     (d/q '[:find [(pull ?e [:name :description :kind :definition :edit/link :path/absolute
                             {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type :edition :title-short :volume :container-title :issue] } :reference/note]}
                             {(:port/_input-for :as :concept/inputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
@@ -127,7 +118,7 @@
                             {(:external/_to :as :concepts/external-links) [:external/key :external/site :external/url]}
                             {:concept/is-a [:name :path/absolute]}])
                   ...]
-           :where [?e :schema "concept"]]
+           :where [?e :schema "concept"] [?e :references]]
          @conn)))
 
 ;; create index :db/id -> absolute-path, then walk through each doc and replace :db/id with relative-path
