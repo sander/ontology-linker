@@ -11,6 +11,7 @@
 
 (defn- add-unique-temporary-ids [] (map-indexed #(assoc %2 :db/id (- (inc %1)))))
 (defn- replace-key-if-found [k f] (fn [x] (if-let [v (k x)] (merge (f v) (dissoc x k)) x)))
+(defn- definition-name [{:keys [name id] :as d}] (assoc d :definition/name (or name id)))
 
 (defn read-definitions!
   "Reads json files recursively from path into a flat vector with keyword keys."
@@ -110,19 +111,6 @@
    :slots {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
    :slot/definition {:db/valueType :db.type/ref}})
 
-(def concept-pattern
-  [:name :description :kind :link/edit :path/absolute
-   {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type
-                                                                       :edition :title-short :volume :container-title
-                                                                       :issue]}
-                                                   :reference/note]}
-   {(:port/_input-for :as :definition/inputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
-   {(:port/_output-for :as :definition/outputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
-   {(:external/_to :as :concepts/external-links) [:external/key :external/site :external/url]}
-   {:concept/is-a [:name :path/absolute]}
-   {:annotation/definition [{:sexp/atom [:name :id :path/absolute]} :sexp/operation {:sexp/arguments '...}]}
-   {:definition/slots [:slot/definition :slot]}])
-
 (defn relativize [base path]
   (loop [result [] wd (drop-last 1 base)]
     (cond
@@ -175,7 +163,7 @@
                        :port/slot slot}))
              #_(map #(into {} (filter val) %))
              #_(add-unique-temporary-ids))
-        (d/q '[:find ?concept (pull ?port [:description :name :slot :type :definition])
+        (d/q '[:find ?concept (pull ?port [:description :definition/name :slot :type :definition])
                :in $ [?field ...]
                :where [?concept ?field ?port] #_[?port :type ?type] #_[?port-concept :id ?type]]
              db [:inputs :outputs])))
@@ -184,9 +172,9 @@
   {:path/absolute [:concepts/alphabetical-by-name]
    ::letters
    (->> db
-        (d/q '[:find [(pull ?e [:name :path/absolute]) ...] :where [?e :schema "concept"]])
-        (sort-by :name)
-        (group-by (comp str/lower-case first :name))
+        (d/q '[:find [(pull ?e [:definition/name :path/absolute]) ...] :where [?e :schema "concept"]])
+        (sort-by :definition/name)
+        (group-by (comp str/lower-case first :definition/name))
         (sort-by first)
         (map (fn [[letter concepts]] {::letter letter ::concepts concepts})))})
 
@@ -194,7 +182,7 @@
   {:path/absolute [:annotations/grouped-by-language-and-package]
    ::languages
    (->> db
-        (d/q '[:find [(pull ?e [:language :package :name :path/absolute]) ...] :where [?e :schema "annotation"]])
+        (d/q '[:find [(pull ?e [:language :package :definition/name :path/absolute]) ...] :where [?e :schema "annotation"]])
         (sort-by :path/absolute)
         (group-by (fn [{:keys [:language :package]}] [language package]))
         (sort-by first)
@@ -213,8 +201,8 @@
 
 (def index {:path/absolute [:index]
             :ontology/title "Data Science Ontology"
-            :indices [{:index/name "Index of concepts" :path/absolute [:annotations/grouped-by-language-and-package]}
-                      {:index/name "Index of annotations" :path/absolute [:concepts/alphabetical-by-name]}]})
+            :indices [{:index/name "Index of annotations" :path/absolute [:annotations/grouped-by-language-and-package]}
+                      {:index/name "Index of concepts" :path/absolute [:concepts/alphabetical-by-name]}]})
 
 (comment
     (let [input "/home/sander/src/datascienceontology/build"
@@ -224,6 +212,7 @@
            (mapcat #(cond (map? %) [%] (vector? %) %))
            (into [] (add-unique-temporary-ids))
            (update-with-linked-sexp-definitions)
+           (map definition-name)
            #_(update-with-linked-slot-types)
            #_(filter :definition/slots)
            #_(map pprint)
@@ -244,11 +233,32 @@
                       (sort-by first)
                       (map (fn [[letter concepts]] {::letter letter ::concepts concepts}))))
       (->>
-           (conj (d/q `[:find [(~@['pull '?e concept-pattern]) ...] :in ~@'[$ [?schema ...]] :where ~'[?e :schema ?schema]]
+           (conj (d/q '[:find [(pull ?e [:definition/name
+                                         :description
+                                         :kind
+                                         :link/edit
+                                         :path/absolute
+                                         :language
+                                         :package
+                                         :class
+                                         {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type
+                                                                                                             :edition :title-short :volume :container-title
+                                                                                                             :issue]}
+                                                                                         :reference/note]}
+                                         {(:port/_input-for :as :definition/inputs) [:port/name :port/description {:port/type [:definition/name :path/absolute]}]}
+                                         {(:port/_output-for :as :definition/outputs) [:port/name :port/description {:port/type [:definition/name :path/absolute]}]}
+                                         {(:external/_to :as :concept/external) [:external/key :external/site :external/url]}
+                                         {:concept/is-a [:definition/name :path/absolute]}
+                                         {:annotation/definition [{:sexp/atom [:definition/name :path/absolute]} :sexp/operation {:sexp/arguments ...}]}
+                                         {:definition/slots [:slot/definition :slot]}])
+                               ...]
+                        :in $ [?schema ...]
+                        :where [?e :schema ?schema]]
                       @conn ["concept" "annotation"])
                  (concepts-alphabetical-by-name @conn)
                  (annotations-grouped-by-language-and-package @conn)
                  index)
+           (map #(merge % {::ontology {:definition/name "Data Science Ontology" :path/absolute [:index]}}))
            #_(filter (constantly false))
            (map (doc->json-filename-and-content output))
            (map (fn [[path json]] (doto path io/make-parents (spit json)))))))
