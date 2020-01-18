@@ -204,64 +204,57 @@
             :indices [{:index/name "Index of annotations" :path/absolute [:annotations/grouped-by-language-and-package]}
                       {:index/name "Index of concepts" :path/absolute [:concepts/alphabetical-by-name]}]})
 
+(defn build-linked-data!
+  "Reads recursively a folder of JSON concept definitions and code annotations, writes JSON-LD to output."
+  [input output]
+  (let [conn (d/create-conn schema)]
+    (->> (read-definitions! (io/as-file input))
+         (mapcat #(cond (map? %) [%] (vector? %) %))
+         (into [] (add-unique-temporary-ids))
+         (update-with-linked-sexp-definitions)
+         (map definition-name)
+         #_(update-with-linked-slot-types)
+         #_(filter :definition/slots)
+         #_(map pprint)
+         (map add-absolute-path)
+         (map add-edit-link)
+         (d/transact! conn))
+    (doseq [tx [transaction-to-set-is-a-entity-ids
+                transaction-to-define-references
+                transaction-to-define-ports
+                transaction-to-define-external-links]]
+      (d/transact! conn (tx @conn)))
+    (->> (conj (d/q '[:find [(pull ?e [:definition/name
+                                       :description
+                                       :kind
+                                       :link/edit
+                                       :path/absolute
+                                       :language
+                                       :package
+                                       :class
+                                       {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type
+                                                                                                           :edition :title-short :volume :container-title
+                                                                                                           :issue]}
+                                                                                       :reference/note]}
+                                       {(:port/_input-for :as :definition/inputs) [:port/name :port/description {:port/type [:definition/name :path/absolute]}]}
+                                       {(:port/_output-for :as :definition/outputs) [:port/name :port/description {:port/type [:definition/name :path/absolute]}]}
+                                       {(:external/_to :as :concept/external) [:external/key :external/site :external/url]}
+                                       {:concept/is-a [:definition/name :path/absolute]}
+                                       {:annotation/definition [{:sexp/atom [:definition/name :path/absolute]} :sexp/operation {:sexp/arguments ...}]}
+                                       {:definition/slots [:slot/definition :slot]}])
+                             ...]
+                      :in $ [?schema ...]
+                      :where [?e :schema ?schema]]
+                    @conn ["concept" "annotation"])
+               (concepts-alphabetical-by-name @conn)
+               (annotations-grouped-by-language-and-package @conn)
+               index)
+         (map #(merge % {::ontology {:definition/name "Data Science Ontology" :path/absolute [:index]}}))
+         (map (doc->json-filename-and-content output))
+         (map (fn [[path json]] (doto path io/make-parents (spit json)))))))
+
 (comment
-    (let [input "/home/sander/src/datascienceontology/build"
-          output "/home/sander/src/datascienceontology/json-ld"
-          conn (d/create-conn schema)]
-      (->> (read-definitions! (io/as-file input))
-           (mapcat #(cond (map? %) [%] (vector? %) %))
-           (into [] (add-unique-temporary-ids))
-           (update-with-linked-sexp-definitions)
-           (map definition-name)
-           #_(update-with-linked-slot-types)
-           #_(filter :definition/slots)
-           #_(map pprint)
-           (map add-absolute-path)
-           (map add-edit-link)
-           (d/transact! conn))
-      (doseq [tx [transaction-to-set-is-a-entity-ids
-                  transaction-to-define-references
-                  transaction-to-define-ports
-                  transaction-to-define-external-links]]
-        (d/transact! conn (tx @conn)))
-      #_(concepts-alphabetical-by-name @conn)
-      #_(annotations-grouped-by-language-and-package @conn)
-      #_(into [] (->> (vals concepts)
-                      (sort-by :id)
-                      (map (fn [{:keys [id]}] {::local-absolute-id [:concepts/by-id id]}))
-                      (group-by (comp str/lower-case first second ::local-absolute-id))
-                      (sort-by first)
-                      (map (fn [[letter concepts]] {::letter letter ::concepts concepts}))))
-      (->>
-           (conj (d/q '[:find [(pull ?e [:definition/name
-                                         :description
-                                         :kind
-                                         :link/edit
-                                         :path/absolute
-                                         :language
-                                         :package
-                                         :class
-                                         {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type
-                                                                                                             :edition :title-short :volume :container-title
-                                                                                                             :issue]}
-                                                                                         :reference/note]}
-                                         {(:port/_input-for :as :definition/inputs) [:port/name :port/description {:port/type [:definition/name :path/absolute]}]}
-                                         {(:port/_output-for :as :definition/outputs) [:port/name :port/description {:port/type [:definition/name :path/absolute]}]}
-                                         {(:external/_to :as :concept/external) [:external/key :external/site :external/url]}
-                                         {:concept/is-a [:definition/name :path/absolute]}
-                                         {:annotation/definition [{:sexp/atom [:definition/name :path/absolute]} :sexp/operation {:sexp/arguments ...}]}
-                                         {:definition/slots [:slot/definition :slot]}])
-                               ...]
-                        :in $ [?schema ...]
-                        :where [?e :schema ?schema]]
-                      @conn ["concept" "annotation"])
-                 (concepts-alphabetical-by-name @conn)
-                 (annotations-grouped-by-language-and-package @conn)
-                 index)
-           (map #(merge % {::ontology {:definition/name "Data Science Ontology" :path/absolute [:index]}}))
-           #_(filter (constantly false))
-           (map (doc->json-filename-and-content output))
-           (map (fn [[path json]] (doto path io/make-parents (spit json)))))))
+  (build-linked-data! "/home/sander/src/datascienceontology/build" "/home/sander/src/datascienceontology/json-ld"))
 
 (comment
   (let [data [{:id :foo :description [:compose [:product [:id :transformation-model] [:copy :data]]
