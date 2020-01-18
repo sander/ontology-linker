@@ -1,49 +1,62 @@
 (ns nl.sanderdijkhuis.ontology.next
+  "Functions to create JSON-LD from an ontology structured like:
+   https://github.com/IBM/datascienceontology"
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.pprint :refer [pprint]]
-            [datascript.core :as d])
+            [clojure.walk :as walk]
+            [datascript.core :as d]
+            [clojure.string :as str])
   (:import (java.io File)))
 
-(defn read-definitions! [^File path]
+(defn- add-unique-temporary-ids [] (map-indexed #(assoc %2 :db/id (- (inc %1)))))
+(defn- replace-key-if-found [k f] (fn [x] (if-let [v (k x)] (merge (f v) (dissoc x k)) x)))
+
+(defn read-definitions!
+  "Reads json files recursively from path into a flat vector with keyword keys."
+  [^File path]
   (into [] (comp (filter #(.isFile %))
                  (filter #(not= (.getAbsolutePath path) (.getParent %)))
                  (map io/reader)
-                 (map #(json/read % :key-fn keyword))) (file-seq path)))
+                 (map #(json/read % :key-fn keyword)))
+        (file-seq path)))
 
-(defn add-indices []
-  (map-indexed #(assoc %2 :db/id (- (inc %1)))))
-
-(defn is-a-references-tx [db]
+(defn transaction-to-set-is-a-entity-ids
+  "Sets :concept/is-a to entity IDs based on :is-a."
+  [db]
   (map (fn [[e a]] [:db/add e :concept/is-a a])
-       (d/q '[:find ?e ?a :where [?e :schema "concept"] [?e :is-a ?a-id] [?a :id ?a-id]] db)))
+       (d/q '[:find ?e ?a :where [?e :schema "concept"] [?e :is-a ?a-id] [?a :id ?a-id] [?a :schema "concept"]] db)))
 
-(defn references-references-tx [db]
+(defn transaction-to-define-references
+  "Defines new entities based on concept :references."
+  [db]
   (into [] (comp (map (fn [[concept source {:keys [note]}]]
                         (into {} (filter val) {:reference/concept concept :reference/source source :reference/note note})))
-                 (add-indices))
+                 (add-unique-temporary-ids))
         (d/q '[:find ?concept ?source (pull ?reference [:note])
                :where [?concept :references ?reference] [?reference :key ?key] [?source :id ?key]] db)))
 
-(defn inputs-references-tx [db]
-  (->> db
-       (d/q '[:find ?concept (pull ?port [:description :name]) ?port-concept
-              :where [?concept :inputs ?port] [?port :type ?type] [?port-concept :id ?type]])
-       (map (fn [[concept {:keys [description name]} type]]
-              {:port/input-for concept :port/name name :port/description description :port/type type}))
-       (map (fn [m] (into {} (filter val) m)))
-       (into [] (add-indices))))
+#_(defn transaction-to-define-ports
+    "Defines new entities based on :inputs and :outputs."
+    [db]
+    (into [] (comp
+                 (map (fn [x] (println x) x))
+                 (map (fn [[concept {:keys [description name slot]} type field]])
+                      {({:inputs :port/input-for :outputs :port/output-for} field) concept
+                       :port/name name
+                       :port/description description
+                       :port/type type
+                       :port/slot slot})
+                 (map #(into {} (filter val) %))
+                 (add-unique-temporary-ids))
+            (d/q '[:find ?concept (pull ?port [:description :name :slot]) ?port-concept ?field
+                   :in $ [?field ...]
+                   :where [?concept ?field ?port] #_[?port :type ?type] #_[?port-concept :id ?type]]
+                 db [:inputs :outputs])))
 
-(defn outputs-references-tx [db]
-  (->> db
-       (d/q '[:find ?concept (pull ?port [:description :name]) ?port-concept
-              :where [?concept :outputs ?port] [?port :type ?type] [?port-concept :id ?type]])
-       (map (fn [[concept {:keys [description name]} type]]
-              {:port/output-for concept :port/name name :port/description description :port/type type}))
-       (map (fn [m] (into {} (filter val) m)))
-       (into [] (add-indices))))
-
-(defn external-references-tx [db]
+(defn transaction-to-define-external-links
+  "Defines new entities based on :external."
+  [db]
   (->> db
        (d/q '[:find ?concept ?references
               :where [?concept :external ?references]])
@@ -54,35 +67,31 @@
                                          :wikipedia (str "https://en.wikipedia.org/wiki/" id)
                                          :wikidata (str "https://www.wikidata.org/wiki/" id))})
                       refs)))
-       (into [] (add-indices))))
+       (into [] (add-unique-temporary-ids))))
 
-(defn expand-definitions [x]
+(defn update-with-linked-sexp-definitions
+  "Updates a list of entities with linked sexp definitions where applicable."
+  [x]
   (let [index (into {} (comp (filter (comp #{"concept"} :schema)) (map (juxt :id :db/id))) x)]
     (letfn [(expand [d] (if (vector? d)
-                          (let [[h & t] d]
-                            {:sexp/operation h
-                             :sexp/arguments (map expand t)})
-                          (if-let [v (index d)]
-                            {:sexp/atom (index d)}
-                            (throw (Exception. (str "could not find '" d "' while expanding"))))))]
-      (map (fn [{d :definition :as v}]
-             (if d
-               (-> v (assoc :annotation/definition (expand d)) (dissoc :definition))
-               v))
-       x))))
+                          (let [[h & t] d] {:sexp/operation h :sexp/arguments (map expand t)})
+                          {:sexp/atom (index d)}))]
+      (map (fn [{d :definition :as v}] (if d (assoc v :annotation/definition (expand d)) v)) x))))
 
-(defn add-path [{s :schema i :id lang :language pkg :package :as x}]
+(defn add-absolute-path
+  [{s :schema i :id lang :language pkg :package :as x}]
   (assoc x :path/absolute (case s
                             "concept" [:concepts/by-id i]
                             "annotation" [:annotations/by-language-package-id lang pkg i]
                             [:references/by-id i])))
 
-(defn add-edit-link [{s :schema id :id lang :language pkg :package :as x}]
+(defn add-edit-link
+  [{s :schema id :id lang :language pkg :package :as x}]
   (let [prefix "https://github.com/IBM/datascienceontology/blob/master/"]
-    (case s
-      "concept" (assoc x :edit/link (str prefix "concept/" id ".yml"))
-      "annotation" (assoc x :edit/link (str prefix "annotation/" lang "/" pkg "/" id ".yml"))
-      x)))
+    (merge x (case s
+               "concept" {:link/edit (str prefix "concept/" id ".yml")}
+               "annotation" {:link/edit (str prefix "annotation/" lang "/" pkg "/" id ".yml")}
+               nil))))
 
 (def schema
   {:is-a                  {:db/cardinality :db.cardinality/many}
@@ -97,31 +106,106 @@
    :port/input-for        {:db/valueType :db.type/ref}
    :port/output-for       {:db/valueType :db.type/ref}
    :port/type             {:db/valueType :db.type/ref}
-   :external/to           {:db/valueType :db.type/ref}})
+   :external/to           {:db/valueType :db.type/ref}
+   :slots {:db/isComponent true :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :slot/definition {:db/valueType :db.type/ref}})
+
+(def concept-pattern
+  [:name :description :kind :link/edit :path/absolute
+   {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type
+                                                                       :edition :title-short :volume :container-title
+                                                                       :issue]}
+                                                   :reference/note]}
+   {(:port/_input-for :as :definition/inputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
+   {(:port/_output-for :as :definition/outputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
+   {(:external/_to :as :concepts/external-links) [:external/key :external/site :external/url]}
+   {:concept/is-a [:name :path/absolute]}
+   {:annotation/definition [{:sexp/atom [:name :id :path/absolute]} :sexp/operation {:sexp/arguments '...}]}
+   {:definition/slots [:slot/definition :slot]}])
+
+(defn relativize [base path]
+  (loop [result [] wd (drop-last 1 base)]
+    (cond
+      (= wd path) result
+      (= wd (drop-last 1 path)) (conj result (last path))
+      (empty? wd) (concat result path)
+      :else (recur (conj result :..) (drop-last 1 wd)))))
+
+(defn path->iri [path]
+  (str/join \/ (map #(case %
+                       :.. ".."
+                       :concepts/by-id "concepts"
+                       :annotations/by-language-package-id "annotations"
+                       :index "index"
+                       :concepts/alphabetical-by-name (str (namespace %) \- (name %))
+                       :annotations/grouped-by-language-and-package (str (namespace %) \- (name %))
+                       %) path)))
+
+(defn doc->json-filename-and-content
+  [output]
+  (fn [{b :path/absolute :as r}]
+    [(str (io/as-file output) \/ (path->iri b) ".json")
+     (json/write-str
+       (walk/postwalk (replace-key-if-found :path/absolute (fn [id] {"@id" (str (path->iri (relativize b id)) ".json")}))
+                      (dissoc r :path/absolute)))]))
+
+(defn- concept-index [x] (into {} (comp (filter (comp #{"concept"} :schema)) (map (juxt :id :db/id))) x))
+
+#_
+(defn update-with-linked-slot-types
+  [x]
+  (let [index (concept-index x)]
+    (map (replace-key-if-found :slots (fn [slots]
+                                        (println :slots slots)
+                                        {:definition/slots (map (replace-key-if-found :definition (fn [d] {:slot/definition (index d)}))
+                                                                slots)}))
+         x)))
+
+(defn transaction-to-define-ports
+  "Defines new entities based on :inputs and :outputs."
+  [db]
+  (into [] (comp
+             #_(map (fn [x] (println x) x))
+             (filter (constantly false))
+             #_(map (fn [[concept {:keys [description name slot]} type field]]
+                      {({:inputs :port/input-for :outputs :port/output-for} field) concept
+                       :port/name name
+                       :port/description description
+                       :port/type type
+                       :port/slot slot}))
+             #_(map #(into {} (filter val) %))
+             #_(add-unique-temporary-ids))
+        (d/q '[:find ?concept (pull ?port [:description :name :slot :type :definition])
+               :in $ [?field ...]
+               :where [?concept ?field ?port] #_[?port :type ?type] #_[?port-concept :id ?type]]
+             db [:inputs :outputs])))
 
 (comment
-  (let [input "/home/sander/src/datascienceontology/build"
-        conn (d/create-conn schema)]
-    (->> (read-definitions! (io/as-file input))
-         (mapcat #(cond (map? %) [%] (vector? %) %))
-         (into [] (add-indices))
-         (expand-definitions)
-         (map add-path)
-         (map add-edit-link)
-         (d/transact! conn))
-    (doseq [tx [is-a-references-tx references-references-tx inputs-references-tx outputs-references-tx external-references-tx]]
-      (d/transact! conn (tx @conn)))
-    (d/q '[:find [(pull ?e [:name :description :kind :definition :edit/link :path/absolute
-                            {(:reference/_concept :as :concept/references) [{:reference/source [:DOI :author :issued :publisher :title :type :edition :title-short :volume :container-title :issue] } :reference/note]}
-                            {(:port/_input-for :as :concept/inputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
-                            {(:port/_output-for :as :concept/outputs) [:port/name :port/description {:port/type [:name :path/absolute]}]}
-                            {(:external/_to :as :concepts/external-links) [:external/key :external/site :external/url]}
-                            {:concept/is-a [:name :path/absolute]}])
-                  ...]
-           :where [?e :schema "concept"] [?e :references]]
-         @conn)))
-
-;; create index :db/id -> absolute-path, then walk through each doc and replace :db/id with relative-path
+    (let [input "/home/sander/src/datascienceontology/build"
+          output "/home/sander/src/datascienceontology/json-ld"
+          conn (d/create-conn schema)]
+      (->> (read-definitions! (io/as-file input))
+           (mapcat #(cond (map? %) [%] (vector? %) %))
+           (into [] (add-unique-temporary-ids))
+           (update-with-linked-sexp-definitions)
+           #_(update-with-linked-slot-types)
+           #_(filter :definition/slots)
+           #_(map pprint)
+           (map add-absolute-path)
+           (map add-edit-link)
+           (d/transact! conn))
+      (doseq [tx [transaction-to-set-is-a-entity-ids
+                  transaction-to-define-references
+                  transaction-to-define-ports
+                  transaction-to-define-external-links]]
+        (d/transact! conn (tx @conn)))
+      (->>
+           #_(d/q `[:find [(~@['pull '?e concept-pattern]) ...] :where ~'[?e :schema "concept"]])
+           (d/q `[:find [(~@['pull '?e concept-pattern]) ...] :in ~'$ ~'[?schema ...] :where ~'[?e :schema "concept"]]
+                @conn ["concept" "annotation"])
+           #_(filter (constantly false))
+           #_(map (doc->json-filename-and-content output))
+           #_(map (fn [[path json]] (doto path io/make-parents (spit json)))))))
 
 (comment
   (let [data [{:id :foo :description [:compose [:product [:id :transformation-model] [:copy :data]]
@@ -135,11 +219,11 @@
                 :sexp/atom          {:db/valueType :db.type/ref}}
         conn (d/create-conn schema)]
     (->> data
-         (into [] (add-indices))
-         expand-definitions
-         (map add-path)
+         (into [] (add-unique-temporary-ids))
+         update-with-linked-sexp-definitions
+         (map add-absolute-path)
          (d/transact! conn))
-    #_(d/transact! conn (expand-definitions @conn))
+    #_(d/transact! conn (update-with-linked-sexp-definitions @conn))
     (d/q '[:find (pull ?e [:id :name :schema {:annotation/definition [{:sexp/atom [:name :id :path/absolute]} :sexp/operation {:sexp/arguments ...}]}])
            :where [?e :id :foo]]
          @conn)))
