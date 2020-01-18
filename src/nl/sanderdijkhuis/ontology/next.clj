@@ -180,6 +180,42 @@
                :where [?concept ?field ?port] #_[?port :type ?type] #_[?port-concept :id ?type]]
              db [:inputs :outputs])))
 
+(defn concepts-alphabetical-by-name [db]
+  {:path/absolute [:concepts/alphabetical-by-name]
+   ::letters
+   (->> db
+        (d/q '[:find [(pull ?e [:name :path/absolute]) ...] :where [?e :schema "concept"]])
+        (sort-by :name)
+        (group-by (comp str/lower-case first :name))
+        (sort-by first)
+        (map (fn [[letter concepts]] {::letter letter ::concepts concepts})))})
+
+(defn annotations-grouped-by-language-and-package [db]
+  {:path/absolute [:annotations/grouped-by-language-and-package]
+   ::languages
+   (->> db
+        (d/q '[:find [(pull ?e [:language :package :name :path/absolute]) ...] :where [?e :schema "annotation"]])
+        (sort-by :path/absolute)
+        (group-by (fn [{:keys [:language :package]}] [language package]))
+        (sort-by first)
+        (map (fn [[package annotations]] {::package package ::annotations annotations}))
+        (group-by (comp first ::package))
+        (map (fn [[language packages]] {::language language ::packages packages})))}
+  #_(into [] (->> (vals annotations)
+                  (sort-by annotation-name)
+                  (map (fn [{:keys [language package id] :as a}]
+                         {:name (annotation-name a) ::local-absolute-id [:annotations/by-id language package id]}))
+                  (group-by #(let [{[_ language package] ::local-absolute-id} %] [language package]))
+                  (sort-by first)
+                  (map (fn [[package annotations]] {::package package ::annotations annotations}))
+                  (group-by (comp first ::package))
+                  (map (fn [[language packages]] {::language language ::packages packages})))))
+
+(def index {:path/absolute [:index]
+            :ontology/title "Data Science Ontology"
+            :indices [{:index/name "Index of concepts" :path/absolute [:annotations/grouped-by-language-and-package]}
+                      {:index/name "Index of annotations" :path/absolute [:concepts/alphabetical-by-name]}]})
+
 (comment
     (let [input "/home/sander/src/datascienceontology/build"
           output "/home/sander/src/datascienceontology/json-ld"
@@ -199,13 +235,23 @@
                   transaction-to-define-ports
                   transaction-to-define-external-links]]
         (d/transact! conn (tx @conn)))
+      #_(concepts-alphabetical-by-name @conn)
+      #_(annotations-grouped-by-language-and-package @conn)
+      #_(into [] (->> (vals concepts)
+                      (sort-by :id)
+                      (map (fn [{:keys [id]}] {::local-absolute-id [:concepts/by-id id]}))
+                      (group-by (comp str/lower-case first second ::local-absolute-id))
+                      (sort-by first)
+                      (map (fn [[letter concepts]] {::letter letter ::concepts concepts}))))
       (->>
-           #_(d/q `[:find [(~@['pull '?e concept-pattern]) ...] :where ~'[?e :schema "concept"]])
-           (d/q `[:find [(~@['pull '?e concept-pattern]) ...] :in ~'$ ~'[?schema ...] :where ~'[?e :schema "concept"]]
-                @conn ["concept" "annotation"])
+           (conj (d/q `[:find [(~@['pull '?e concept-pattern]) ...] :in ~@'[$ [?schema ...]] :where ~'[?e :schema ?schema]]
+                      @conn ["concept" "annotation"])
+                 (concepts-alphabetical-by-name @conn)
+                 (annotations-grouped-by-language-and-package @conn)
+                 index)
            #_(filter (constantly false))
-           #_(map (doc->json-filename-and-content output))
-           #_(map (fn [[path json]] (doto path io/make-parents (spit json)))))))
+           (map (doc->json-filename-and-content output))
+           (map (fn [[path json]] (doto path io/make-parents (spit json)))))))
 
 (comment
   (let [data [{:id :foo :description [:compose [:product [:id :transformation-model] [:copy :data]]
